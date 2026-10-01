@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# lsvm: ls-style listing of VMware Workstation VMs, with live resource usage for running ones.
+#
+#   lsvm        list all VMs (running ones first)
+#   lsvm -r     list running VMs only
+#   lsvm -h     help
+
+INVENTORY="$HOME/.vmware/inventory.vmls"
+SAMPLE=0.5   # seconds used to measure CPU usage
+
+only_running=0
+case "$1" in
+    -r|--running) only_running=1 ;;
+    -h|--help) sed -n '2,6s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    "") ;;
+    *) echo "lsvm: unknown option '$1' (try -h)" >&2; exit 1 ;;
+esac
+
+if [[ -t 1 ]]; then
+    G=$'\e[1;32m' D=$'\e[2m' B=$'\e[1m' C=$'\e[36m' R=$'\e[0m'
+else
+    G='' D='' B='' C='' R=''
+fi
+
+# Read a key from a .vmx file (case-insensitive key, quotes stripped)
+vmx_get() {
+    awk -v k="$2" 'tolower($1)==tolower(k) {sub(/^[^=]*= *"/,""); sub(/" *$/,""); print; exit}' "$1"
+}
+
+# VMware guestOS id -> readable name (VMware's ids lag its marketing: "windows9-64" is Windows 10)
+os_name() {
+    local id=$1 arch=x86
+    [[ $id == *-64 ]] && arch=x64
+    id=${id%-64}
+    case $id in
+        windows9)            echo "Windows 10 $arch" ;;
+        windows11)           echo "Windows 11 $arch" ;;
+        windows8)            echo "Windows 8 $arch" ;;
+        windows7)            echo "Windows 7 $arch" ;;
+        windows9srv)         echo "Win Server 2016 $arch" ;;
+        windows2019srv)      echo "Win Server 2019 $arch" ;;
+        windows2019srvNext)  echo "Win Server 2022 $arch" ;;
+        windows2022srvNext)  echo "Win Server 2025 $arch" ;;
+        ubuntu)              echo "Ubuntu $arch" ;;
+        debian[0-9]*)        echo "Debian ${id#debian} $arch" ;;
+        almalinux)           echo "AlmaLinux $arch" ;;
+        rockylinux)          echo "Rocky Linux $arch" ;;
+        rhel[0-9]*)          echo "RHEL ${id#rhel} $arch" ;;
+        centos[0-9]*)        echo "CentOS ${id#centos} $arch" ;;
+        centos)              echo "CentOS $arch" ;;
+        fedora)              echo "Fedora $arch" ;;
+        opensuse)            echo "openSUSE $arch" ;;
+        arch*)               echo "Arch Linux $arch" ;;
+        other*linux*)        echo "Linux $arch" ;;
+        darwin*)             echo "macOS $arch" ;;
+        "")                  echo "-" ;;
+        *)                   echo "$1" ;;  # unknown: show the raw id
+    esac
+}
+
+human_mb() {  # MB -> human readable
+    awk -v m="$1" 'BEGIN{ if (m>=1024) printf "%.1fG", m/1024; else printf "%dM", m }'
+}
+
+human_secs() {
+    local s=$1 d h m
+    d=$((s/86400)); h=$((s%86400/3600)); m=$((s%3600/60))
+    if ((d)); then printf '%dd%02dh' "$d" "$h"
+    elif ((h)); then printf '%dh%02dm' "$h" "$m"
+    else printf '%dm' "$m"; fi
+}
+
+# ---- collect VM configs from the inventory -------------------------------
+declare -a VMX
+if [[ -f $INVENTORY ]]; then
+    while IFS= read -r path; do
+        [[ -n $path && -f $path ]] && VMX+=("$path")
+    done < <(awk -F' = ' '$1 ~ /^vmlist[0-9]+\.config$/ {gsub(/"/,"",$2); print $2}' "$INVENTORY")
+fi
+if ((${#VMX[@]} == 0)); then
+    echo "lsvm: no VMs found in $INVENTORY" >&2
+    exit 1
+fi
+
+# ---- map running vmware-vmx processes to their .vmx path -------------------
+declare -A PID_OF
+for pid in $(pgrep -x vmware-vmx); do
+    # last argv element is the .vmx path (may contain spaces)
+    vmx=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | tail -n1)
+    [[ -n $vmx ]] && PID_OF["$(realpath -m "$vmx")"]=$pid
+done
+
+# ---- sample CPU time of running VMs ---------------------------------------
+cpu_ticks() { awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null; }
+declare -A T0 CPU
+if ((${#PID_OF[@]})); then
+    for pid in "${PID_OF[@]}"; do T0[$pid]=$(cpu_ticks "$pid"); done
+    sleep "$SAMPLE"
+    hz=$(getconf CLK_TCK)
+    for pid in "${PID_OF[@]}"; do
+        t1=$(cpu_ticks "$pid")
+        CPU[$pid]=$(awk -v a="${T0[$pid]:-0}" -v b="${t1:-0}" -v hz="$hz" -v s="$SAMPLE" \
+            'BEGIN{printf "%.1f", (b-a)/hz/s*100}')
+    done
+fi
+
+# ---- build rows -------------------------------------------------------------
+running_rows=() stopped_rows=()
+tot_cpu=0 tot_rss=0 tot_alloc=0 tot_vcpu=0 nrun=0
+
+for vmx in "${VMX[@]}"; do
+    real=$(realpath -m "$vmx")
+    name=$(vmx_get "$vmx" displayName); name=${name:-$(basename "$vmx" .vmx)}
+    os=$(os_name "$(vmx_get "$vmx" guestOS)")
+    mem=$(vmx_get "$vmx" memsize); mem=${mem:-0}
+    vcpu=$(vmx_get "$vmx" numvcpus); vcpu=${vcpu:-1}
+    disk=$(du -sh "$(dirname "$vmx")" 2>/dev/null | cut -f1)
+    pid=${PID_OF[$real]}
+
+    if [[ -n $pid ]]; then
+        rss_kb=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null); rss_kb=${rss_kb:-0}
+        rss_mb=$((rss_kb/1024))
+        up=$(ps -o etimes= -p "$pid" | tr -d ' ')
+        cpu=${CPU[$pid]:-0.0}
+        pct=$(awk -v r="$rss_mb" -v m="$mem" 'BEGIN{ if (m>0) printf "%d%%", r/m*100; else print "-" }')
+        running_rows+=("$(printf '%s|%s|%s|%s|%s%%|%s / %s (%s)|%s|%s|%s' \
+            "$name" "$os" "$vcpu" "$(human_mb "$mem")" \
+            "$cpu" "$(human_mb "$rss_mb")" "$(human_mb "$mem")" "$pct" \
+            "$(human_secs "${up:-0}")" "$disk" "$pid")")
+        tot_cpu=$(awk -v a="$tot_cpu" -v b="$cpu" 'BEGIN{print a+b}')
+        ((tot_rss += rss_mb, tot_alloc += mem, tot_vcpu += vcpu, nrun++))
+    elif ((!only_running)); then
+        stopped_rows+=("$(printf '%s|%s|%s|%s|-|-|-|%s|-' \
+            "$name" "$os" "$vcpu" "$(human_mb "$mem")" "$disk")")
+    fi
+done
+
+# ---- print -----------------------------------------------------------------
+{
+    echo 'NAME|GUEST OS|vCPU|RAM|CPU|HOST MEM USED|UPTIME|DISK|PID'
+    for row in "${running_rows[@]}"; do echo "$row"; done
+    for row in "${stopped_rows[@]}"; do echo "$row"; done
+} | column -t -s '|' | { n=0; while IFS= read -r line; do
+    # colorize after alignment so escape codes don't skew column widths:
+    # header, then the running rows (printed first) green, the stopped ones dim
+    if ((n == 0)); then echo "$C$B$line$R"
+    elif ((n <= ${#running_rows[@]})); then echo "$G$line$R"
+    else echo "$D$line$R"; fi
+    ((n++))
+done; }
