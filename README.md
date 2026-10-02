@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo-light.svg" alt="lsvm" width="420">
+  </picture>
+</p>
+
 # lsvm
 
 An `ls`-style listing of VMware Workstation VMs on Linux, with live resource usage for the running ones.
